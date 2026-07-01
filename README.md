@@ -1,153 +1,244 @@
-# Docker Manager
+# GolangBackend
 
-> Backend e biblioteca pública para gerenciamento de servidores Docker locais ou remotos.
+API HTTP em Go para cadastro e autenticação de usuários, organizada em
+**Clean Architecture (ports & adapters)**. As senhas são armazenadas com **bcrypt**
+e os dados ficam em **PostgreSQL**.
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
-[![Version](https://img.shields.io/badge/version-1.0.0-orange.svg)]()
+---
 
-## Visão geral
+## Sumário
 
-Docker Manager é uma solução composta por uma **API backend** e uma **biblioteca cliente pública** que permitem gerenciar containers, imagens, volumes e redes Docker em hosts locais ou remotos a partir de uma interface unificada. Conecte-se a múltiplos daemons Docker simultaneamente, execute operações em lote e monitore recursos em tempo real.
+- [Tecnologias](#tecnologias)
+- [Estrutura do projeto](#estrutura-do-projeto)
+- [A regra de dependência](#a-regra-de-dependência-por-que-isso-é-robusto)
+- [Como rodar](#como-rodar)
+- [Configuração (.env)](#configuração-env)
+- [Endpoints da API](#endpoints-da-api)
+- [Segurança](#segurança)
+- [Como estender](#como-estender)
 
-## Recursos
+---
 
-- **Multi-host** — gerencie vários servidores Docker (local, SSH, TCP/TLS) a partir de um único ponto.
-- **Containers** — criar, iniciar, parar, reiniciar, remover, inspecionar e acompanhar logs em streaming.
-- **Imagens** — pull, push, build, tag e remoção, com suposto suporte a registries privados.
-- **Volumes e redes** — criação, listagem e limpeza de recursos órfãos.
-- **Monitoramento** — estatísticas de CPU, memória, rede e I/O em tempo real via WebSocket.
-- **Autenticação** — controle de acesso por token (JWT) e por host.
-- **Biblioteca cliente** — SDK público para integrar o backend em outras aplicações.
+## Tecnologias
 
-## Arquitetura
+- **Go 1.25+** — usa o roteamento por método do `net/http` (Go 1.22+), sem framework externo.
+- **PostgreSQL** — driver [`github.com/lib/pq`](https://github.com/lib/pq).
+- **bcrypt** — [`golang.org/x/crypto/bcrypt`](https://pkg.go.dev/golang.org/x/crypto/bcrypt) para hash de senhas.
+- **Docker Compose** — sobe o banco para desenvolvimento.
+
+---
+
+## Estrutura do projeto
 
 ```
-┌─────────────┐      ┌──────────────┐      ┌─────────────────┐
-│   Client    │─────▶│   Backend    │─────▶│  Docker Daemon  │
-│   (Lib/SDK) │ HTTP │   (API/WS)   │ API  │  (local/remoto) │
-└─────────────┘      └──────────────┘      └─────────────────┘
+cmd/api/main.go                       → entrypoint: só "liga" as peças
+internal/
+  domain/
+    user.go        → entidade User + interface UserRepository + erros de domínio
+  usecase/
+    user.go        → UserUseCase: regras de negócio + bcrypt (depende só de domain)
+  store/
+    postgres/
+      user.go      → UserStore: adapter que IMPLEMENTA domain.UserRepository
+  transport/
+    http/
+      user.go      → UserHandler: DTOs JSON + tradução de erro → status HTTP
+      router.go    → monta rotas, middlewares e injeta as dependências
+  config/          → Config + leitor de .env
+  database/        → Connect + Migrate
+  middleware/      → CORS + rate limit
+  httputil/        → helpers de resposta JSON (indentado com 2 espaços)
 ```
 
-O backend expõe uma API REST + WebSocket e se comunica com cada daemon Docker através do socket Unix local ou de conexões remotas (SSH / TCP+TLS). A biblioteca cliente abstrai essas chamadas.
+Cada camada tem **uma responsabilidade**:
 
-## Instalação
+| Camada            | Responsabilidade                                                        |
+| ----------------- | ----------------------------------------------------------------------- |
+| `domain`          | Núcleo do negócio: a entidade `User`, o contrato `UserRepository` e os erros. Não importa ninguém. |
+| `usecase`         | Regras de negócio (validação, hash da senha, orquestração). Depende só das *interfaces* de `domain`. |
+| `store/postgres`  | Adapter de persistência: implementa `domain.UserRepository` em SQL.     |
+| `transport/http`  | Camada de entrega: converte JSON ↔ tipos do usecase e mapeia erros para status HTTP. |
+| `config`          | Carrega configuração do `.env`/ambiente com valores padrão.             |
+| `database`        | Abre a conexão e roda as migrações (idempotentes).                      |
+| `middleware`      | CORS e rate limit por IP.                                               |
+| `httputil`        | Helpers `JSON()` e `Error()` para respostas padronizadas.              |
 
-### Backend
+---
+
+## A regra de dependência (por que isso é "robusto")
+
+O fluxo de dependências aponta sempre **para dentro**, em direção ao domínio:
+
+```
+transport/http  ─→  usecase  ─→  domain  ←─  store/postgres
+   (HTTP/JSON)      (negócio)   (núcleo)      (PostgreSQL)
+```
+
+- **`domain`** não importa nenhuma outra camada. Define **o que** é um `User` e o
+  contrato `UserRepository` (a *porta*).
+- **`usecase`** depende apenas da *interface* `domain.UserRepository` — ele não sabe
+  que existe PostgreSQL. Por isso é **testável com um mock** do repositório.
+- **`store/postgres`** *implementa* a interface (tem
+  `var _ domain.UserRepository = (*UserStore)(nil)`, que garante isso em tempo de
+  compilação).
+- **`transport/http`** converte JSON ↔ tipos do usecase e traduz erros de domínio em
+  status HTTP. A entidade `domain.User` **nunca vaza a senha**: a resposta usa um DTO
+  `userResponse` separado.
+
+A "amarração" (qual store concreto entra em qual usecase) acontece em **um único
+lugar**: `internal/transport/http/router.go`.
+
+```go
+userStore   := postgres.NewUserStore(db)        // adapter concreto
+userUseCase := usecase.NewUserUseCase(userStore) // recebe a interface
+NewUserHandler(userUseCase).RegisterRoutes(mux)  // expõe via HTTP
+```
+
+Trocar o PostgreSQL por outro banco = criar um novo `store/` e mudar essa linha.
+
+---
+
+## Como rodar
+
+### 1. Subir o banco (Docker)
 
 ```bash
-git clone https://github.com/seu-usuario/docker-manager.git
-cd docker-manager
-npm install
-npm run build
+docker compose up -d
 ```
 
-### Biblioteca cliente
+### 2. Rodar a API
 
 ```bash
-npm install docker-manager-client
+go run ./cmd/api
 ```
 
-## Configuração
+A aplicação roda as migrações automaticamente no startup (cria/ajusta a tabela
+`users`) e sobe em `http://localhost:8080`.
 
-Crie um arquivo `.env` na raiz do backend:
+> **Build:**
+> ```bash
+> go build -o bin/api ./cmd/api && ./bin/api
+> ```
 
-```env
-PORT=8080
-JWT_SECRET=sua-chave-secreta
-# Hosts Docker (separados por vírgula)
-DOCKER_HOSTS=unix:///var/run/docker.sock,tcp://192.168.0.10:2376
-# Caminho dos certificados TLS para hosts remotos (opcional)
-DOCKER_TLS_CERT_PATH=/etc/docker/certs
-```
+> **IDE (GoLand/VS Code):** o entrypoint é `cmd/api`. Configure a Run Configuration
+> para o pacote `e/cmd/api` (ou diretório `cmd/api`).
 
-## Uso
+---
 
-### Iniciando o backend
+## Configuração (.env)
+
+As variáveis são lidas do ambiente; o arquivo `.env` é carregado automaticamente.
+Valores padrão são aplicados quando uma variável não está definida.
+
+| Variável      | Padrão           | Descrição                                              |
+| ------------- | ---------------- | ------------------------------------------------------ |
+| `PORT`        | `8080`           | Porta HTTP da API.                                     |
+| `CORS_ORIGIN` | `*`              | Origem permitida no CORS.                              |
+| `RATE_LIMIT`  | `100`            | Número de requisições por janela de tempo.            |
+| `RATE_PERIOD` | `1s`             | Tamanho da janela (`ms`, `s`, `m`, `h`).              |
+| `DB_HOST`     | `localhost`      | Host do PostgreSQL.                                    |
+| `DB_PORT`     | `5432`           | Porta do PostgreSQL.                                   |
+| `DB_USER`     | `postgres`       | Usuário do banco.                                      |
+| `DB_PASSWORD` | `postgres`       | Senha do banco.                                        |
+| `DB_NAME`     | `golangbackend`  | Nome do banco.                                         |
+| `DB_SSLMODE`  | `disable`        | Modo SSL da conexão (`disable`, `require`, etc.).     |
+
+---
+
+## Endpoints da API
+
+Todas as respostas são em JSON **indentado com 2 espaços**. Respostas de erro seguem
+o formato `{ "error": "mensagem" }`.
+
+### `GET /health`
+
+Verifica a saúde da aplicação (inclui `Ping` no banco).
 
 ```bash
-npm start
-# Servidor disponível em http://localhost:8080
+curl localhost:8080/health
+# ok
 ```
 
-### Usando a biblioteca cliente
+### `POST /register`
 
-```javascript
-import { DockerManager } from "docker-manager-client";
-
-const manager = new DockerManager({
-  baseUrl: "http://localhost:8080",
-  token: "seu-jwt-token",
-});
-
-// Conectar a um host remoto
-await manager.hosts.add({
-  name: "producao",
-  url: "tcp://192.168.0.10:2376",
-  tls: true,
-});
-
-// Listar containers
-const containers = await manager.containers.list({ host: "producao" });
-
-// Iniciar um container
-await manager.containers.start("producao", "meu-container");
-
-// Logs em streaming
-manager.containers.logs("producao", "meu-container").on("data", (line) => {
-  console.log(line);
-});
-```
-
-## API REST
-
-| Método | Endpoint | Descrição |
-|--------|----------|-----------|
-| `GET` | `/hosts` | Lista os hosts conectados |
-| `POST` | `/hosts` | Adiciona um novo host |
-| `DELETE` | `/hosts/:id` | Remove um host |
-| `GET` | `/hosts/:id/containers` | Lista containers do host |
-| `POST` | `/hosts/:id/containers/:name/start` | Inicia um container |
-| `POST` | `/hosts/:id/containers/:name/stop` | Para um container |
-| `GET` | `/hosts/:id/images` | Lista imagens |
-| `GET` | `/hosts/:id/volumes` | Lista volumes |
-| `GET` | `/hosts/:id/networks` | Lista redes |
-
-Documentação completa disponível em `/docs` (Swagger) após iniciar o backend.
-
-## Conectando hosts remotos
-
-**Via TCP + TLS** (recomendado para produção):
+Cria um novo usuário (senha mínima de 8 caracteres).
 
 ```bash
-docker -H tcp://0.0.0.0:2376 --tlsverify \
-  --tlscacert=ca.pem --tlscert=server-cert.pem --tlskey=server-key.pem
+curl -X POST localhost:8080/register \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Ana","email":"ana@x.com","password":"senha12345"}'
 ```
 
-**Via SSH:**
-
-```env
-DOCKER_HOSTS=ssh://usuario@192.168.0.10
+**201 Created**
+```json
+{
+  "id": 1,
+  "name": "Ana",
+  "email": "ana@x.com",
+  "role": "user",
+  "created_at": "2026-06-30T22:54:31.922486Z"
+}
 ```
 
-## Requisitos
+| Situação                       | Status |
+| ------------------------------ | ------ |
+| Criado com sucesso             | `201`  |
+| JSON inválido / campos vazios  | `400`  |
+| Senha com menos de 8 chars     | `400`  |
+| E-mail já cadastrado           | `409`  |
 
-- Node.js 18+
-- Docker Engine 20.10+
-- Acesso ao socket Docker ou a um daemon remoto exposto
+### `POST /login`
 
-## Desenvolvimento
+Valida as credenciais comparando a senha com o hash bcrypt.
 
 ```bash
-npm run dev      # modo watch
-npm test         # executa os testes
-npm run lint     # verifica o código
+curl -X POST localhost:8080/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"ana@x.com","password":"senha12345"}'
 ```
 
-## Contribuindo
+| Situação                          | Status |
+| --------------------------------- | ------ |
+| Autenticado                       | `200`  |
+| Credenciais inválidas             | `401`  |
 
-Contribuições são bem-vindas. Abra uma issue para discutir mudanças significativas antes de enviar um pull request. Siga o padrão de commits e garanta que os testes passem.
+> Por segurança, e-mail inexistente e senha errada retornam **a mesma** mensagem
+> (`credenciais inválidas`), para não revelar se um e-mail está cadastrado.
 
-## Licença
+### `GET /users`
 
-Distribuído sob a licença MIT. Veja [LICENSE](LICENSE) para mais detalhes.
+Lista todos os usuários (sem expor senha/hash).
+
+```bash
+curl localhost:8080/users
+```
+
+> Requisições com o método errado (ex.: `GET /register`) retornam **405 Method Not
+> Allowed** automaticamente, graças ao roteamento por método do `net/http`.
+
+---
+
+## Segurança
+
+- **Senhas com bcrypt** (custo 12, com *salt* embutido). O hash fica na coluna
+  `password_hash`; a senha em texto puro nunca é armazenada nem retornada.
+- **DTO de resposta separado da entidade** — o `password_hash` jamais é serializado
+  para o cliente.
+- **Mensagens de erro genéricas no login** para evitar enumeração de e-mails.
+- **Rate limit por IP** e **CORS** configuráveis via `.env`.
+- **Timeouts no servidor HTTP** (Read/Write/Idle) para resiliência.
+
+---
+
+## Como estender
+
+Para adicionar um novo domínio (ex.: `product`), siga o mesmo fluxo:
+
+1. **`domain/product.go`** — entidade `Product` + interface `ProductRepository` + erros.
+2. **`usecase/product.go`** — regras de negócio dependendo da interface.
+3. **`store/postgres/product.go`** — implementação SQL do repositório.
+4. **`transport/http/product.go`** — handler + DTOs JSON.
+5. **`transport/http/router.go`** — registrar as rotas e injetar as dependências.
+
+Como o `usecase` depende de uma *interface*, dá para testá-lo com um mock do
+repositório, sem subir banco.
